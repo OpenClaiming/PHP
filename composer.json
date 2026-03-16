@@ -1,0 +1,15 @@
+{
+  "name": "openclaiming/openclaiming",
+  "description": "OpenClaiming PHP reference implementation",
+  "type": "library",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.0",
+    "sop/json-canonicalization": "^0.1"
+  },
+  "autoload": {
+    "psr-4": {
+      "OpenClaiming\\": "./"
+    }
+  }
+}
