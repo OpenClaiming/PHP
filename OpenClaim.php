@@ -1,544 +1,360 @@
 <?php
 
-class OpenClaim_EVM
-{
-	const PAYMENT_DOMAIN_NAME = "OpenClaiming.payments";
-	const AUTHORIZATION_DOMAIN_NAME = "OpenClaiming.authorizations";
-	const VERSION = "1";
+// Optional strict canonicalizer:
+// composer require sop/json-canonicalization
+//
+// HTTP fetch:
+// Uses file_get_contents (built-in)
+//
+// Base64:
+// Uses base64_encode / base64_decode
+//
+// JSON:
+// Uses json_encode / json_decode
+//
+// P-256 / ECDSA:
+// Uses OpenSSL
+//
+// SHA-256:
+// Uses OpenSSL internal hashing
+//
+// Note:
+// Fallback canonicalization:
+// - lexicographically sorted keys
+// - arrays preserved
+// - numbers converted to strings
+// - no whitespace
+//
+// Signing model:
+// signature = sign( SHA256(canonicalized_claim) )
 
-	private static $PAYMENT_TYPEHASH = null;
-	private static $AUTHORIZATION_TYPEHASH = null;
-	private static $AUTHORIZATION_CONSTRAINT_TYPEHASH = null;
-	private static $AUTHORIZATION_CONTEXT_TYPEHASH = null;
+use OpenClaim\EVM;
 
-	private static function initTypehashes()
-	{
-		if (self::$PAYMENT_TYPEHASH !== null) {
-			return;
-		}
+class OpenClaim {
 
-		self::$PAYMENT_TYPEHASH = self::keccakUtf8(
-			"Payment(address payer,address token,bytes32 recipientsHash,uint256 max,uint256 line,uint256 nbf,uint256 exp)"
-		);
+	// ---------- CACHE ----------
 
-		self::$AUTHORIZATION_TYPEHASH = self::keccakUtf8(
-			"Authorization(address authority,address subject,bytes32 actorsHash,bytes32 rolesHash,bytes32 actionsHash,bytes32 constraintsHash,bytes32 contextsHash,uint256 nbf,uint256 exp)"
-		);
+	private static $fetchCache = [];
+	private static $fetchCacheTime = [];
+	private static $keyCache = [];
+	private static $pubKeyCache = [];
+	private static $fetchTtl = 60;
 
-		self::$AUTHORIZATION_CONSTRAINT_TYPEHASH = self::keccakUtf8(
-			"Constraint(string key,string op,string value)"
-		);
+	private static function fetchCached($url) {
 
-		self::$AUTHORIZATION_CONTEXT_TYPEHASH = self::keccakUtf8(
-			"Context(string type,string value)"
-		);
-	}
+		$now = time();
 
-	private static function requireArray($value, $name)
-	{
-		if (!is_array($value)) {
-			throw new Exception($name . " must be an array");
-		}
-	}
-
-	private static function requireClaimArray($claim)
-	{
-		if (!is_array($claim)) {
-			throw new Exception("claim must be an array");
-		}
-	}
-
-	private static function requireField($claim, $field)
-	{
-		$value = self::readField($claim, $field, null);
-		if ($value === null || $value === "") {
-			throw new Exception("claim." . $field . " is required for EIP712");
-		}
-		return $value;
-	}
-
-	private static function requireAddress($value, $name)
-	{
-		if (!is_string($value) || !preg_match('/^0x[a-fA-F0-9]{40}$/', $value)) {
-			throw new Exception($name . " must be a valid address");
-		}
-	}
-
-	private static function requireChainId($value)
-	{
-		if ($value === null || $value === "") {
-			throw new Exception("claim.chainId is required for EIP712");
-		}
-	}
-
-	private static function toArray($value)
-	{
-		if ($value === null) {
-			return array();
-		}
-		return is_array($value) ? $value : array($value);
-	}
-
-	private static function lower($value)
-	{
-		return strtolower((string)$value);
-	}
-
-	private static function strip0x($hex)
-	{
-		return strpos($hex, "0x") === 0 || strpos($hex, "0X") === 0
-			? substr($hex, 2)
-			: $hex;
-	}
-
-	private static function hex($value)
-	{
-		$hex = self::strip0x((string)$value);
-		return "0x" . strtolower($hex);
-	}
-
-	private static function readField($claim, $key, $fallback = null)
-	{
-		if (is_array($claim) && array_key_exists($key, $claim) && $claim[$key] !== null) {
-			return $claim[$key];
-		}
-		if (
-			is_array($claim)
-			&& isset($claim["stm"])
-			&& is_array($claim["stm"])
-			&& array_key_exists($key, $claim["stm"])
-			&& $claim["stm"][$key] !== null
-		) {
-			return $claim["stm"][$key];
-		}
-		return $fallback;
-	}
-
-	private static function readUint($claim, $key, $fallback = "0")
-	{
-		$value = self::readField($claim, $key, null);
-		if ($value === null || $value === "") {
-			return (string)$fallback;
-		}
-		return (string)$value;
-	}
-
-	private static function keccakUtf8($value)
-	{
-		if (class_exists("\\kornrunner\\Keccak")) {
-			return "0x" . \kornrunner\Keccak::hash((string)$value, 256);
-		}
-
-		throw new Exception(
-			"Keccak implementation not found. Install kornrunner/keccak or replace keccakUtf8()."
-		);
-	}
-
-	private static function keccakHexData($hexData)
-	{
-		$bin = hex2bin(self::strip0x($hexData));
-		if ($bin === false) {
-			throw new Exception("Invalid hex data");
-		}
-
-		if (class_exists("\\kornrunner\\Keccak")) {
-			return "0x" . \kornrunner\Keccak::hash($bin, 256);
-		}
-
-		throw new Exception(
-			"Keccak implementation not found. Install kornrunner/keccak or replace keccakHexData()."
-		);
-	}
-
-	private static function padHex($hex, $bytes)
-	{
-		$hex = self::strip0x($hex);
-		return str_pad(strtolower($hex), $bytes * 2, "0", STR_PAD_LEFT);
-	}
-
-	private static function encodeUint256($value)
-	{
-		if (is_int($value)) {
-			$value = (string)$value;
-		}
-		if (!is_string($value)) {
-			$value = (string)$value;
-		}
-
-		if (strpos($value, "0x") === 0 || strpos($value, "0X") === 0) {
-			return self::padHex($value, 32);
-		}
-
-		if (extension_loaded("gmp")) {
-			$hex = gmp_strval(gmp_init($value, 10), 16);
-			return self::padHex($hex, 32);
-		}
-
-		if (function_exists("bccomp")) {
-			$n = $value;
-			$hex = "";
-			while (bccomp($n, "0") > 0) {
-				$rem = bcmod($n, "16");
-				$hex = dechex((int)$rem) . $hex;
-				$n = bcdiv($n, "16", 0);
-			}
-			if ($hex === "") {
-				$hex = "0";
-			}
-			return self::padHex($hex, 32);
-		}
-
-		if (preg_match('/^\d+$/', $value)) {
-			$hex = dechex((int)$value);
-			return self::padHex($hex, 32);
-		}
-
-		throw new Exception("Cannot encode uint256 without GMP or BCMath for large values");
-	}
-
-	private static function encodeAddress($address)
-	{
-		self::requireAddress($address, "address");
-		return self::padHex(self::strip0x($address), 32);
-	}
-
-	private static function encodeBytes32($value)
-	{
-		$hex = self::strip0x($value);
-		if (strlen($hex) !== 64) {
-			throw new Exception("bytes32 value must be 32 bytes");
-		}
-		return strtolower($hex);
-	}
-
-	private static function encodeDynamicArrayHead($offsetWords)
-	{
-		return self::encodeUint256($offsetWords * 32);
-	}
-
-	private static function abiEncodeAddressArray($values)
-	{
-		$values = self::toArray($values);
-
-		$head = self::encodeUint256(32);
-		$tail = self::encodeUint256(count($values));
-
-		foreach ($values as $value) {
-			self::requireAddress($value, "address array item");
-			$tail .= self::encodeAddress($value);
-		}
-
-		return "0x" . $head . $tail;
-	}
-
-	private static function abiEncodeBytes32Array($values)
-	{
-		$values = self::toArray($values);
-
-		$head = self::encodeUint256(32);
-		$tail = self::encodeUint256(count($values));
-
-		foreach ($values as $value) {
-			$tail .= self::encodeBytes32($value);
-		}
-
-		return "0x" . $head . $tail;
-	}
-
-	private static function abiEncodeStatic($types, $values)
-	{
-		if (count($types) !== count($values)) {
-			throw new Exception("ABI types and values length mismatch");
-		}
-
-		$out = "";
-
-		foreach ($types as $i => $type) {
-			$value = $values[$i];
-
-			switch ($type) {
-				case "bytes32":
-					$out .= self::encodeBytes32($value);
-					break;
-
-				case "address":
-					$out .= self::encodeAddress($value);
-					break;
-
-				case "uint256":
-					$out .= self::encodeUint256($value);
-					break;
-
-				default:
-					throw new Exception("Unsupported static ABI type: " . $type);
+		if (isset(self::$fetchCache[$url])) {
+			if (($now - self::$fetchCacheTime[$url]) < self::$fetchTtl) {
+				return self::$fetchCache[$url];
 			}
 		}
 
-		return "0x" . $out;
+		$data = @file_get_contents($url);
+
+		self::$fetchCache[$url] = $data;
+		self::$fetchCacheTime[$url] = $now;
+
+		return $data;
 	}
 
-	public static function hashRecipients($recipients)
-	{
-		return self::keccakHexData(self::abiEncodeAddressArray($recipients));
-	}
+	// ---------- CANONICALIZATION ----------
 
-	public static function hashActors($actors)
-	{
-		return self::keccakHexData(self::abiEncodeAddressArray($actors));
-	}
+	private static function normalize($v) {
 
-	public static function hashStringArray($values)
-	{
-		$values = self::toArray($values);
-		$hashes = array();
+		if (is_array($v)) {
 
-		foreach ($values as $value) {
-			$hashes[] = self::keccakUtf8((string)$value);
+			if (array_keys($v) !== range(0, count($v)-1)) {
+				ksort($v);
+			}
+
+			foreach ($v as $k => $val) {
+				$v[$k] = self::normalize($val);
+			}
 		}
 
-		return self::keccakHexData(self::abiEncodeBytes32Array($hashes));
-	}
-
-	public static function hashConstraint($constraint)
-	{
-		self::initTypehashes();
-		self::requireArray($constraint, "constraint");
-
-		$encoded = self::abiEncodeStatic(
-			array("bytes32", "bytes32", "bytes32", "bytes32"),
-			array(
-				self::$AUTHORIZATION_CONSTRAINT_TYPEHASH,
-				self::keccakUtf8($constraint["key"] ?? ""),
-				self::keccakUtf8($constraint["op"] ?? ""),
-				self::keccakUtf8($constraint["value"] ?? "")
-			)
-		);
-
-		return self::keccakHexData($encoded);
-	}
-
-	public static function hashConstraints($constraints)
-	{
-		$constraints = self::toArray($constraints);
-		$hashes = array();
-
-		foreach ($constraints as $constraint) {
-			$hashes[] = self::hashConstraint($constraint);
+		if (is_numeric($v)) {
+			return (string)$v;
 		}
 
-		return self::keccakHexData(self::abiEncodeBytes32Array($hashes));
+		return $v;
 	}
 
-	public static function hashContext($context)
-	{
-		self::initTypehashes();
-		self::requireArray($context, "context");
+	private static function fallbackCanonicalize($claim) {
 
-		$encoded = self::abiEncodeStatic(
-			array("bytes32", "bytes32", "bytes32"),
-			array(
-				self::$AUTHORIZATION_CONTEXT_TYPEHASH,
-				self::keccakUtf8($context["typ"] ?? ""),
-				self::keccakUtf8($context["value"] ?? "")
-			)
-		);
+		unset($claim["sig"]);
 
-		return self::keccakHexData($encoded);
+		$sorted = self::normalize($claim);
+
+		return json_encode($sorted, JSON_UNESCAPED_SLASHES);
 	}
 
-	public static function hashContexts($contexts)
-	{
-		$contexts = self::toArray($contexts);
-		$hashes = array();
+	public static function canonicalize($claim) {
 
-		foreach ($contexts as $context) {
-			$hashes[] = self::hashContext($context);
+		$obj = $claim;
+		unset($obj["sig"]);
+
+		if (class_exists("\\Sop\\JsonCanonicalization\\Canonicalizer")) {
+			try {
+				$canon = new \Sop\JsonCanonicalization\Canonicalizer();
+				return $canon->canonicalize($obj);
+			} catch (\Exception $e) {}
 		}
 
-		return self::keccakHexData(self::abiEncodeBytes32Array($hashes));
+		return self::fallbackCanonicalize($claim);
 	}
 
-	public static function detectType($claim)
-	{
-		$payer = self::readField($claim, "payer", null);
-		$token = self::readField($claim, "token", null);
-		$line = self::readField($claim, "line", null);
+	// ---------- HELPERS ----------
 
-		if ($payer && $token !== null && $line !== null) {
-			return "payment";
+	private static function toArray($v) {
+		if ($v === null) return [];
+		return is_array($v) ? $v : [$v];
+	}
+
+	private static function ensureSorted($keys) {
+		$sorted = $keys;
+		sort($sorted, SORT_STRING);
+		if ($sorted !== $keys) {
+			throw new Exception("OpenClaim: key array must be lexicographically sorted");
+		}
+	}
+
+	private static function ensureUnique($keys) {
+		if (count(array_unique($keys)) !== count($keys)) {
+			throw new Exception("OpenClaim: duplicate keys are not allowed");
+		}
+	}
+
+	private static function stripPem($pem) {
+		return preg_replace('/-----.*PUBLIC KEY-----|\s+/', '', $pem);
+	}
+
+	private static function derToPem($b64) {
+		return "-----BEGIN PUBLIC KEY-----\n" .
+			chunk_split($b64, 64, "\n") .
+			"-----END PUBLIC KEY-----";
+	}
+
+	private static function getCachedPublicKey($b64) {
+
+		if (isset(self::$pubKeyCache[$b64])) {
+			return self::$pubKeyCache[$b64];
 		}
 
-		$authority = self::readField($claim, "authority", null);
-		$subject = self::readField($claim, "subject", null);
+		$pem = self::derToPem($b64);
 
-		if ($authority && $subject) {
-			return "authorization";
+		self::$pubKeyCache[$b64] = $pem;
+
+		return $pem;
+	}
+
+	// ---------- DATA KEY ----------
+
+	private static function parseDataKey($keyStr) {
+
+		if (strpos($keyStr, "data:key/") !== 0) return null;
+
+		$idx = strpos($keyStr, ",");
+		if ($idx === false) return null;
+
+		$meta = substr($keyStr, 5, $idx - 5);
+		$data = substr($keyStr, $idx + 1);
+
+		$parts = explode(";", $meta);
+		$fmt = strtoupper(str_replace("key/", "", $parts[0]));
+
+		$encoding = "raw";
+
+		foreach ($parts as $p) {
+			if ($p === "base64") $encoding = "base64";
+			if ($p === "base64url") $encoding = "base64url";
 		}
 
-		return null;
-	}
-
-	public static function toPaymentPayload($claim)
-	{
-		self::requireClaimArray($claim);
-		self::initTypehashes();
-
-		$chainId = $claim["chainId"] ?? null;
-		$contract = $claim["contract"] ?? null;
-		$payer = self::requireField($claim, "payer");
-		$token = self::requireField($claim, "token");
-		$recipients = self::toArray(self::readField($claim, "recipients", array()));
-
-		self::requireChainId($chainId);
-		self::requireAddress($contract, "claim.contract");
-		self::requireAddress($payer, "claim.payer");
-		self::requireAddress($token, "claim.token");
-
-		return array(
-			"primaryType" => "Payment",
-			"domain" => array(
-				"name" => self::PAYMENT_DOMAIN_NAME,
-				"version" => self::VERSION,
-				"chainId" => $chainId,
-				"verifyingContract" => $contract
-			),
-			"types" => array(
-				"Payment" => array(
-					array("name" => "payer", "type" => "address"),
-					array("name" => "token", "type" => "address"),
-					array("name" => "recipientsHash", "type" => "bytes32"),
-					array("name" => "max", "type" => "uint256"),
-					array("name" => "line", "type" => "uint256"),
-					array("name" => "nbf", "type" => "uint256"),
-					array("name" => "exp", "type" => "uint256")
-				)
-			),
-			"value" => array(
-				"payer" => $payer,
-				"token" => $token,
-				"recipientsHash" => self::hashRecipients($recipients),
-				"max" => self::readUint($claim, "max", "0"),
-				"line" => self::readUint($claim, "line", "0"),
-				"nbf" => self::readUint($claim, "nbf", "0"),
-				"exp" => self::readUint($claim, "exp", "0")
-			),
-			"data" => array(
-				"recipients" => $recipients
-			)
-		);
-	}
-
-	public static function toAuthorizationPayload($claim)
-	{
-		self::requireClaimArray($claim);
-		self::initTypehashes();
-
-		$chainId = $claim["chainId"] ?? null;
-		$contract = $claim["contract"] ?? null;
-		$authority = self::requireField($claim, "authority");
-		$subject = self::requireField($claim, "subject");
-		$actors = self::toArray(self::readField($claim, "actors", array()));
-		$roles = self::toArray(self::readField($claim, "roles", array()));
-		$actions = self::toArray(self::readField($claim, "actions", array()));
-		$constraints = self::toArray(self::readField($claim, "constraints", array()));
-		$contexts = self::toArray(self::readField($claim, "contexts", array()));
-
-		self::requireChainId($chainId);
-		self::requireAddress($contract, "claim.contract");
-		self::requireAddress($authority, "claim.authority");
-		self::requireAddress($subject, "claim.subject");
-
-		return array(
-			"primaryType" => "Authorization",
-			"domain" => array(
-				"name" => self::AUTHORIZATION_DOMAIN_NAME,
-				"version" => self::VERSION,
-				"chainId" => $chainId,
-				"verifyingContract" => $contract
-			),
-			"types" => array(
-				"Authorization" => array(
-					array("name" => "authority", "type" => "address"),
-					array("name" => "subject", "type" => "address"),
-					array("name" => "actorsHash", "type" => "bytes32"),
-					array("name" => "rolesHash", "type" => "bytes32"),
-					array("name" => "actionsHash", "type" => "bytes32"),
-					array("name" => "constraintsHash", "type" => "bytes32"),
-					array("name" => "contextsHash", "type" => "bytes32"),
-					array("name" => "nbf", "type" => "uint256"),
-					array("name" => "exp", "type" => "uint256")
-				)
-			),
-			"value" => array(
-				"authority" => $authority,
-				"subject" => $subject,
-				"actorsHash" => self::hashActors($actors),
-				"rolesHash" => self::hashStringArray($roles),
-				"actionsHash" => self::hashStringArray($actions),
-				"constraintsHash" => self::hashConstraints($constraints),
-				"contextsHash" => self::hashContexts($contexts),
-				"nbf" => self::readUint($claim, "nbf", "0"),
-				"exp" => self::readUint($claim, "exp", "0")
-			),
-			"data" => array(
-				"actors" => $actors,
-				"roles" => $roles,
-				"actions" => $actions,
-				"constraints" => $constraints,
-				"contexts" => $contexts
-			)
-		);
-	}
-
-	public static function toPayload($claim)
-	{
-		$type = self::detectType($claim);
-
-		if ($type === "payment") {
-			return self::toPaymentPayload($claim);
-		}
-		if ($type === "authorization") {
-			return self::toAuthorizationPayload($claim);
+		if ($encoding === "base64") {
+			$data = base64_decode($data);
 		}
 
-		throw new Exception("Unable to detect EIP712 claim type");
-	}
-
-	public static function sign($claim, callable $signTypedData)
-	{
-		$payload = self::toPayload($claim);
-		return $signTypedData(
-			$payload["domain"],
-			$payload["types"],
-			$payload["value"]
-		);
-	}
-
-	public static function verify($claim, $signature, $expectedAddress, callable $recoverTypedData)
-	{
-		$payload = self::toPayload($claim);
-
-		$recovered = $recoverTypedData(
-			$payload["domain"],
-			$payload["types"],
-			$payload["value"],
-			$signature
-		);
-
-		return self::lower($recovered) === self::lower($expectedAddress);
-	}
-
-	public static function verifyKey($claim, $keyObj, $signature, callable $recoverTypedData)
-	{
-		if (!is_array($keyObj) || (($keyObj["typ"] ?? null) !== "EIP712")) {
-			return false;
+		if ($encoding === "base64url") {
+			$data = strtr($data, "-_", "+/");
+			$data = base64_decode($data);
 		}
 
-		return self::verify(
-			$claim,
-			$signature,
-			$keyObj["value"],
-			$recoverTypedData
-		);
+		return ["fmt"=>$fmt, "value"=>$data];
+	}
+
+	// ---------- KEY RESOLUTION ----------
+
+	private static function resolveKey($keyStr, $seen = []) {
+
+		if (in_array($keyStr, $seen)) {
+			throw new Exception("OpenClaim: cyclic key reference detected");
+		}
+
+		if (isset(self::$keyCache[$keyStr])) {
+			return self::$keyCache[$keyStr];
+		}
+
+		$seen[] = $keyStr;
+
+		// data:key
+		if (strpos($keyStr, "data:key/") === 0) {
+			$parsed = self::parseDataKey($keyStr);
+			self::$keyCache[$keyStr] = $parsed;
+			return $parsed;
+		}
+
+		// URL
+		if (strpos($keyStr, "http") === 0) {
+
+			$parts = explode("#", $keyStr);
+			$url = $parts[0];
+
+			$raw = self::fetchCached($url);
+			if (!$raw) return null;
+
+			$data = json_decode($raw, true);
+
+			$current = $data;
+
+			foreach (array_slice($parts,1) as $p) {
+				if (!$p) continue;
+				$current = $current[$p] ?? null;
+				if ($current === null) return null;
+			}
+
+			if (is_array($current)) {
+				self::$keyCache[$keyStr] = $current;
+				return $current;
+			}
+
+			if (is_string($current)) {
+				$res = self::resolveKey($current, $seen);
+				self::$keyCache[$keyStr] = $res;
+				return $res;
+			}
+
+			return null;
+		}
+
+		// legacy
+		$parts = explode(":", $keyStr, 2);
+		if (count($parts) < 2) return null;
+
+		$res = ["fmt"=>strtoupper($parts[0]), "value"=>$parts[1]];
+
+		self::$keyCache[$keyStr] = $res;
+		return $res;
+	}
+
+	// ---------- SIGN ----------
+
+	public static function signWithExisting($claim, $privateKey, $existing = []) {
+
+		$keys = self::toArray($existing["keys"] ?? ($claim["key"] ?? []));
+		$sigs = self::toArray($existing["signatures"] ?? ($claim["sig"] ?? []));
+
+		// EIP712 unchanged
+		if (isset($claim["fmt"])) {
+			$keyStr = "eip712:" . strtolower($claim["signer"]);
+			if (!in_array($keyStr, $keys)) $keys[] = $keyStr;
+			sort($keys);
+			self::ensureSorted($keys);
+			while (count($sigs) < count($keys)) $sigs[] = null;
+			$sigs[array_search($keyStr,$keys)] = EVM::sign($claim,$privateKey);
+
+			return $claim + ["key"=>$keys,"sig"=>$sigs];
+		}
+
+		// ES256
+
+		$pub = openssl_pkey_get_details(openssl_pkey_get_private($privateKey));
+		$der = self::stripPem($pub["key"]);
+
+		$keyStr = "data:key/es256;base64," . $der;
+
+		if (!in_array($keyStr, $keys)) $keys[] = $keyStr;
+
+		sort($keys);
+		self::ensureUnique($keys);
+		self::ensureSorted($keys);
+
+		while (count($sigs) < count($keys)) $sigs[] = null;
+
+		$index = array_search($keyStr, $keys);
+
+		$tmp = $claim;
+		$tmp["key"] = $keys;
+		$tmp["sig"] = $sigs;
+
+		$canon = self::canonicalize($tmp);
+
+		openssl_sign($canon, $signature, $privateKey, OPENSSL_ALGO_SHA256);
+
+		$sigs[$index] = base64_encode($signature);
+
+		return $claim + ["key"=>$keys,"sig"=>$sigs];
+	}
+
+	// ---------- VERIFY ----------
+
+	public static function verify($claim, $policy = []) {
+
+		$keys = self::toArray($claim["key"] ?? []);
+		$sigs = self::toArray($claim["sig"] ?? []);
+
+		if (!$keys) {
+			throw new Exception("OpenClaim: missing public keys");
+		}
+
+		self::ensureSorted($keys);
+
+		$tmp = $claim;
+		$tmp["key"] = $keys;
+		$tmp["sig"] = $sigs;
+
+		$canon = self::canonicalize($tmp);
+
+		$valid = 0;
+
+		foreach ($keys as $i => $k) {
+
+			if (!isset($sigs[$i]) || $sigs[$i] === null) continue;
+
+			$resolved = self::resolveKey($k);
+
+			$keyObjs = is_array($resolved) && isset($resolved[0])
+				? $resolved
+				: [$resolved];
+
+			foreach ($keyObjs as $ko) {
+
+				if (!$ko || $ko["fmt"] !== "ES256") continue;
+
+				$der = is_string($ko["value"])
+					? $ko["value"]
+					: base64_encode($ko["value"]);
+
+				$pub = self::getCachedPublicKey($der);
+
+				$ok = openssl_verify(
+					$canon,
+					base64_decode($sigs[$i]),
+					$pub,
+					OPENSSL_ALGO_SHA256
+				);
+
+				if ($ok === 1) {
+					$valid++;
+					break;
+				}
+			}
+		}
+
+		$minValid = $policy["minValid"] ?? 1;
+		if (($policy["mode"] ?? "") === "all") {
+			$minValid = count($keys);
+		}
+
+		return $valid >= $minValid;
 	}
 }

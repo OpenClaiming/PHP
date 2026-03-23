@@ -1,15 +1,16 @@
 {
-  "name": "openclaiming/openclaiming",
-  "description": "OpenClaiming PHP reference implementation",
-  "type": "library",
-  "license": "MIT",
-  "require": {
-    "php": ">=8.0",
-    "sop/json-canonicalization": "^0.1"
-  },
-  "autoload": {
-    "psr-4": {
-      "OpenClaiming\\": "./"
-    }
-  }
+	"name": "openclaiming/openclaim",
+	"description": "OpenClaiming protocol signing and verification, with EVM support",
+	"type": "library",
+	"require": {
+		"php": ">=7.1",
+		"ext-gmp": "*",
+		"mdanter/ecc": "^1.0",
+		"kornrunner/keccak": "^1.1"
+	},
+	"autoload": {
+		"psr-4": {
+			"OpenClaiming\\": "src/"
+		}
+	}
 }
